@@ -1,3 +1,5 @@
+# Temporarily disabled this on the repo
+# Will evaluate further as part of ENSOMATA-1100
 name: Build
 # Limit a single job to run at a time for a given branch/PR to save resources and speed up CI
 # see https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
