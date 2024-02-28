@@ -1,3 +1,5 @@
+# Temporarily disabled this on the repo
+# Will evaluate further as part of ENSOMATA-1100
 name: 'Chromatic'
 
 on: push
