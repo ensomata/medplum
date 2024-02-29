@@ -1,3 +1,7 @@
+# This workflow has been disabled in the Github UI
+# Not needed until we diverge from the source repo
+# Should update the 'on' to be pushes against 'prod' branch
+# Should also remove turbo stuff + potentially switch Dockerhub to ECR
 name: Deploy
 concurrency:
   group: ci-deploy-${{ github.sha }}
