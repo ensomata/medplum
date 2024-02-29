@@ -1,3 +1,5 @@
+# Not needed until we diverge from the source repo
+# Hasn't been edited, but we probably want ot get rid of the turbo cahcing stuff, update the slack setting, ensure published npm packages are in our private space, evaluate if we want to use Dockerhub (or switch to ECR), + add any relevant repo secrets
 name: Publish
 # Based on: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
 on:
