@@ -19,8 +19,8 @@ jobs:
       pull-requests: write
     strategy:
       matrix:
-        node-version: [18, 20]
-        pg-version: [12, 14]
+        node-version: [20]
+        pg-version: [14]
     env:
       NODE_VERSION: ${{ matrix.node-version }}
       PG_VERSION: ${{ matrix.pg-version }}
