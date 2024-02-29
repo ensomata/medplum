@@ -1,5 +1,3 @@
-# Temporarily disabled this on the repo
-# Will evaluate further as part of ENSOMATA-1100
 # Borrowed from: https://github.com/oven-sh/bun/blob/main/.github/workflows/prettier-fmt.yml
 name: prettier
 
