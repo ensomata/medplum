@@ -1,3 +1,6 @@
+# Not needed until we diverge from the source repo
+# Hasn't been edited, but I think we can swap staging for dev + update the 'on' for merges to main
+# Should also remove turbo stuff + potentially switch Dockerhub to ECR
 name: Staging
 
 concurrency:
