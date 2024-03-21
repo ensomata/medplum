@@ -2,10 +2,10 @@ import { accepted, getResourceTypes, protectedResourceTypes } from '@medplum/cor
 import { Project, ResourceType } from '@medplum/fhirtypes';
 import { Request, Response } from 'express';
 import { getConfig } from '../../config';
+import { getAuthenticatedContext } from '../../context';
 import { sendOutcome } from '../outcomes';
 import { getPatientResourceTypes } from '../patient';
 import { BulkExporter } from './utils/bulkexporter';
-import { getAuthenticatedContext } from '../../context';
 
 /**
  * Handles a bulk export request.
@@ -63,7 +63,11 @@ export async function exportResources(
   const resourceTypes = getResourceTypesByExportLevel(exportLevel);
 
   for (const resourceType of resourceTypes) {
-    if (!canBeExported(resourceType) || (types && !types.includes(resourceType))) {
+    if (
+      !canBeExported(resourceType) ||
+      (types && !types.includes(resourceType)) ||
+      !exporter.repo.canReadResourceType(resourceType)
+    ) {
       continue;
     }
     await exportResourceType(exporter, resourceType);
@@ -111,7 +115,14 @@ function getResourceTypesByExportLevel(exportLevel: string): ResourceType[] {
   return getResourceTypes();
 }
 
-const unexportedResourceTypes = ['CodeSystem', 'SearchParameter', 'StructureDefinition', 'ValueSet', 'BulkDataExport'];
+const unexportedResourceTypes = [
+  'Binary',
+  'CodeSystem',
+  'SearchParameter',
+  'StructureDefinition',
+  'ValueSet',
+  'BulkDataExport',
+];
 
 function canBeExported(resourceType: string): boolean {
   return !unexportedResourceTypes.includes(resourceType) && !protectedResourceTypes.includes(resourceType);

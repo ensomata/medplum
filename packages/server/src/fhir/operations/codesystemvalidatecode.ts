@@ -3,15 +3,17 @@ import { CodeSystem, Coding } from '@medplum/fhirtypes';
 import { Request, Response } from 'express';
 import { getDatabasePool } from '../../database';
 import { sendOutcome } from '../outcomes';
-import { Column, Condition, SelectQuery } from '../sql';
+import { SelectQuery } from '../sql';
 import { getOperationDefinition } from './definitions';
 import { parseInputParameters, sendOutputParameters } from './utils/parameters';
-import { findCodeSystem } from './expand';
+import { findTerminologyResource } from './utils/terminology';
+import { getAuthenticatedContext } from '../../context';
 
 const operation = getOperationDefinition('CodeSystem', 'validate-code');
 
 type CodeSystemValidateCodeParameters = {
   url?: string;
+  version?: string;
   code?: string;
   coding?: Coding;
 };
@@ -28,18 +30,29 @@ type CodeSystemValidateCodeParameters = {
 export async function codeSystemValidateCodeHandler(req: Request, res: Response): Promise<void> {
   const params = parseInputParameters<CodeSystemValidateCodeParameters>(operation, req);
 
+  let codeSystem: CodeSystem;
+  if (req.params.id) {
+    codeSystem = await getAuthenticatedContext().repo.readResource<CodeSystem>('CodeSystem', req.params.id);
+  } else if (params.url) {
+    codeSystem = await findTerminologyResource<CodeSystem>('CodeSystem', params.url, params.version);
+  } else if (params.coding?.system) {
+    codeSystem = await findTerminologyResource<CodeSystem>('CodeSystem', params.coding.system, params.version);
+  } else {
+    sendOutcome(res, badRequest('No code system specified'));
+    return;
+  }
+
   let coding: Coding;
   if (params.coding) {
     coding = params.coding;
-  } else if (params.url && params.code) {
-    coding = { system: params.url, code: params.code };
+  } else if (params.code) {
+    coding = { system: params.url ?? codeSystem.url, code: params.code };
   } else {
     sendOutcome(res, badRequest('No coding specified'));
     return;
   }
 
-  const codeSystem = await findCodeSystem(coding.system as string);
-  const result = await validateCode(codeSystem, coding.code as string);
+  const result = await validateCoding(codeSystem, coding);
 
   const output: Record<string, any> = Object.create(null);
   if (result) {
@@ -51,21 +64,20 @@ export async function codeSystemValidateCodeHandler(req: Request, res: Response)
   await sendOutputParameters(req, res, operation, allOk, output);
 }
 
-export async function validateCode(codeSystem: CodeSystem, code: string): Promise<Coding | undefined> {
-  const query = new SelectQuery('Coding');
-  const codeSystemTable = query.getNextJoinAlias();
-  query.innerJoin(
-    'CodeSystem',
-    codeSystemTable,
-    new Condition(new Column('Coding', 'system'), '=', new Column(codeSystemTable, 'id'))
-  );
-  query
+export async function validateCoding(codeSystem: CodeSystem, coding: Coding): Promise<Coding | undefined> {
+  if (coding.system && coding.system !== codeSystem.url) {
+    return undefined;
+  }
+
+  const query = new SelectQuery('Coding')
     .column('id')
     .column('display')
-    .where(new Column(codeSystemTable, 'id'), '=', codeSystem.id)
-    .where('code', '=', code);
+    .where('code', '=', coding.code)
+    .where('system', '=', codeSystem.id);
 
   const db = getDatabasePool();
   const result = await query.execute(db);
-  return result.length ? { id: result[0].id, system: codeSystem.url, code, display: result[0].display } : undefined;
+  return result.length
+    ? { id: result[0].id, system: codeSystem.url, code: coding.code, display: result[0].display }
+    : undefined;
 }
