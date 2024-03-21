@@ -1,10 +1,11 @@
-import { allOk, ContentType, isOk, OperationOutcomeError, validateResource } from '@medplum/core';
+import { allOk, ContentType, isOk, OperationOutcomeError } from '@medplum/core';
 import { FhirRequest, FhirRouter, HttpMethod } from '@medplum/fhir-router';
 import { NextFunction, Request, Response, Router } from 'express';
 import { asyncWrap } from '../async';
 import { getConfig } from '../config';
 import { getAuthenticatedContext } from '../context';
 import { authenticateRequest } from '../oauth/middleware';
+import { recordHistogramValue } from '../otel/otel';
 import { bulkDataRouter } from './bulkdata';
 import { jobRouter } from './job';
 import { getCapabilityStatement } from './metadata';
@@ -27,11 +28,13 @@ import { planDefinitionApplyHandler } from './operations/plandefinitionapply';
 import { projectCloneHandler } from './operations/projectclone';
 import { projectInitHandler } from './operations/projectinit';
 import { resourceGraphHandler } from './operations/resourcegraph';
+import { structureDefinitionExpandProfileHandler } from './operations/structuredefinitionexpandprofile';
+import { codeSystemSubsumesOperation } from './operations/subsumes';
+import { valueSetValidateOperation } from './operations/valuesetvalidatecode';
 import { sendOutcome } from './outcomes';
 import { isFhirJsonContentType, sendResponse } from './response';
 import { smartConfigurationHandler, smartStylingHandler } from './smart';
-import { structureDefinitionExpandProfileHandler } from './operations/structuredefinitionexpandprofile';
-import { recordHistogramValue } from '../otel/otel';
+import { agentStatusHandler } from './operations/agentstatus';
 
 export const fhirRouter = Router();
 
@@ -104,18 +107,42 @@ protectedRoutes.post('/ConceptMap/:id/([$]|%24)translate', asyncWrap(conceptMapT
 
 // ValueSet $expand operation
 protectedRoutes.get('/ValueSet/([$]|%24)expand', expandOperator);
+protectedRoutes.post('/ValueSet/([$]|%24)expand', expandOperator);
 
 // CodeSystem $import operation
 protectedRoutes.post('/CodeSystem/([$]|%24)import', asyncWrap(codeSystemImportHandler));
+protectedRoutes.post('/CodeSystem/:id/([$]|%24)import', asyncWrap(codeSystemImportHandler));
 
 // CodeSystem $lookup operation
+protectedRoutes.get('/CodeSystem/([$]|%24)lookup', asyncWrap(codeSystemLookupHandler));
 protectedRoutes.post('/CodeSystem/([$]|%24)lookup', asyncWrap(codeSystemLookupHandler));
+protectedRoutes.get('/CodeSystem/:id/([$]|%24)lookup', asyncWrap(codeSystemLookupHandler));
+protectedRoutes.post('/CodeSystem/:id/([$]|%24)lookup', asyncWrap(codeSystemLookupHandler));
 
 // CodeSystem $validate-code operation
+protectedRoutes.get('/CodeSystem/([$]|%24)validate-code', asyncWrap(codeSystemValidateCodeHandler));
 protectedRoutes.post('/CodeSystem/([$]|%24)validate-code', asyncWrap(codeSystemValidateCodeHandler));
+protectedRoutes.get('/CodeSystem/:id/([$]|%24)validate-code', asyncWrap(codeSystemValidateCodeHandler));
+protectedRoutes.post('/CodeSystem/:id/([$]|%24)validate-code', asyncWrap(codeSystemValidateCodeHandler));
+
+// CodeSystem $subsumes operation
+protectedRoutes.get('/CodeSystem/([$]|%24)subsumes', codeSystemSubsumesOperation);
+protectedRoutes.post('/CodeSystem/([$]|%24)subsumes', codeSystemSubsumesOperation);
+protectedRoutes.get('/CodeSystem/:id/([$]|%24)subsumes', codeSystemSubsumesOperation);
+protectedRoutes.post('/CodeSystem/:id/([$]|%24)subsumes', codeSystemSubsumesOperation);
+
+// ValueSet $validate-code operation
+protectedRoutes.get('/ValueSet/([$]|%24)validate-code', valueSetValidateOperation);
+protectedRoutes.post('/ValueSet/([$]|%24)validate-code', valueSetValidateOperation);
+protectedRoutes.get('/ValueSet/:id/([$]|%24)validate-code', valueSetValidateOperation);
+protectedRoutes.post('/ValueSet/:id/([$]|%24)validate-code', valueSetValidateOperation);
 
 // CSV Export
 protectedRoutes.get('/:resourceType/([$]|%24)csv', asyncWrap(csvHandler));
+
+// Agent $status operation
+protectedRoutes.get('/Agent/([$]|%24)status', agentStatusHandler);
+protectedRoutes.get('/Agent/:id/([$]|%24)status', agentStatusHandler);
 
 // Agent $push operation
 protectedRoutes.post('/Agent/([$]|%24)push', agentPushHandler);
@@ -166,7 +193,10 @@ protectedRoutes.post('/:resourceType/:id/([$]|%24)expunge', asyncWrap(expungeHan
 protectedRoutes.get('/Subscription/:id/([$]|%24)get-ws-binding-token', asyncWrap(getWsBindingTokenHandler));
 
 // StructureDefinition $expand-profile operation
-protectedRoutes.get('/StructureDefinition/([$]|%24)expand-profile', asyncWrap(structureDefinitionExpandProfileHandler));
+protectedRoutes.post(
+  '/StructureDefinition/([$]|%24)expand-profile',
+  asyncWrap(structureDefinitionExpandProfileHandler)
+);
 
 // Validate create resource
 protectedRoutes.post(
@@ -176,7 +206,8 @@ protectedRoutes.post(
       res.status(400).send('Unsupported content type');
       return;
     }
-    validateResource(req.body);
+    const ctx = getAuthenticatedContext();
+    await ctx.repo.validateResource(req.body);
     sendOutcome(res, allOk);
   })
 );
@@ -210,14 +241,16 @@ protectedRoutes.use(
     const ctx = getAuthenticatedContext();
     if (!internalFhirRouter) {
       internalFhirRouter = new FhirRouter({ introspectionEnabled: getConfig().introspectionEnabled });
-      internalFhirRouter.addEventListener('warn', (e: any) => ctx.logger.warn(e.message));
+      internalFhirRouter.addEventListener('warn', (e: any) =>
+        ctx.logger.warn(e.message, { ...e.data, project: ctx.project.id })
+      );
       internalFhirRouter.addEventListener('batch', ({ count, errors, size, bundleType }: any) => {
         recordHistogramValue('medplum.batch.entries', count, { bundleType });
         recordHistogramValue('medplum.batch.errors', errors, { bundleType });
         recordHistogramValue('medplum.batch.size', size, { bundleType });
 
         if (errors > 0 && bundleType === 'transaction') {
-          ctx.logger.warn('Error processing transaction Bundle', { count, errors, size });
+          ctx.logger.warn('Error processing transaction Bundle', { count, errors, size, project: ctx.project.id });
         }
       });
     }
@@ -227,6 +260,7 @@ protectedRoutes.use(
       params: req.params,
       query: req.query as Record<string, string>,
       body: req.body,
+      headers: req.headers,
     };
 
     const result = await internalFhirRouter.handleRequest(request, ctx.repo);
