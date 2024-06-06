@@ -1,6 +1,5 @@
-import { Group, Stack } from '@mantine/core';
-import { InternalSchemaElement, SliceDefinitionWithTypes, getPathDisplayName } from '@medplum/core';
-import { OperationOutcome } from '@medplum/fhirtypes';
+import { Group, Stack, Text } from '@mantine/core';
+import { ExtendedInternalSchemaElement, SliceDefinitionWithTypes, getPathDisplayName } from '@medplum/core';
 import { useMedplum } from '@medplum/react-hooks';
 import { MouseEvent, useContext, useEffect, useState } from 'react';
 import { ElementsContext } from '../ElementsInput/ElementsInput.utils';
@@ -11,19 +10,18 @@ import { ArrayRemoveButton } from '../buttons/ArrayRemoveButton';
 import { killEvent } from '../utils/dom';
 import classes from './ResourceArrayInput.module.css';
 import { assignValuesIntoSlices, prepareSlices } from './ResourceArrayInput.utils';
+import { BaseInputProps, getValuePath } from '../ResourcePropertyInput/ResourcePropertyInput.utils';
 
-export interface ResourceArrayInputProps {
-  readonly property: InternalSchemaElement;
+export interface ResourceArrayInputProps extends BaseInputProps {
+  readonly property: ExtendedInternalSchemaElement;
   readonly name: string;
-  readonly path: string;
   readonly defaultValue?: any[];
   readonly indent?: boolean;
-  readonly outcome: OperationOutcome | undefined;
   readonly onChange?: (value: any[]) => void;
   readonly hideNonSliceValues?: boolean;
 }
 
-export function ResourceArrayInput(props: ResourceArrayInputProps): JSX.Element {
+export function ResourceArrayInput(props: ResourceArrayInputProps): JSX.Element | null {
   const { property } = props;
   const medplum = useMedplum();
   const [loading, setLoading] = useState(true);
@@ -73,15 +71,18 @@ export function ResourceArrayInput(props: ResourceArrayInputProps): JSX.Element 
   // Hide non-sliced values when handling sliced extensions
   const showNonSliceValues = !(props.hideNonSliceValues ?? (propertyTypeCode === 'Extension' && slices.length > 0));
   const propertyDisplayName = getPathDisplayName(property.path);
+  const showEmptyMessage = props.property.readonly && slices.length === 0 && defaultValue.length === 0;
 
   return (
     <Stack className={props.indent ? classes.indented : undefined}>
+      {showEmptyMessage && <Text c="dimmed">(empty)</Text>}
       {slices.map((slice, sliceIndex) => {
         return (
           <SliceInput
             slice={slice}
             key={slice.name}
             path={props.path}
+            valuePath={props.valuePath}
             property={property}
             defaultValue={slicedValues[sliceIndex]}
             onChange={(newValue: any[]) => {
@@ -101,6 +102,7 @@ export function ResourceArrayInput(props: ResourceArrayInputProps): JSX.Element 
                 property={props.property}
                 name={props.name + '.' + valueIndex}
                 path={props.path}
+                valuePath={getValuePath(props.path, props.valuePath, valueIndex)}
                 defaultValue={value}
                 onChange={(newValue: any) => {
                   const newNonSliceValues = [...nonSliceValues];
@@ -111,19 +113,21 @@ export function ResourceArrayInput(props: ResourceArrayInputProps): JSX.Element 
                 outcome={props.outcome}
               />
             </div>
-            <ArrayRemoveButton
-              propertyDisplayName={propertyDisplayName}
-              testId={`nonsliced-remove-${valueIndex}`}
-              onClick={(e: MouseEvent) => {
-                killEvent(e);
-                const newNonSliceValues = [...nonSliceValues];
-                newNonSliceValues.splice(valueIndex, 1);
-                setValuesWrapper(newNonSliceValues, nonSliceIndex);
-              }}
-            />
+            {!props.property.readonly && (
+              <ArrayRemoveButton
+                propertyDisplayName={propertyDisplayName}
+                testId={`nonsliced-remove-${valueIndex}`}
+                onClick={(e: MouseEvent) => {
+                  killEvent(e);
+                  const newNonSliceValues = [...nonSliceValues];
+                  newNonSliceValues.splice(valueIndex, 1);
+                  setValuesWrapper(newNonSliceValues, nonSliceIndex);
+                }}
+              />
+            )}
           </Group>
         ))}
-      {showNonSliceValues && slicedValues.flat().length < property.max && (
+      {!props.property.readonly && showNonSliceValues && slicedValues.flat().length < property.max && (
         <Group wrap="nowrap" style={{ justifyContent: 'flex-start' }}>
           <ArrayAddButton
             propertyDisplayName={propertyDisplayName}

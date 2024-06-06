@@ -15,6 +15,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       pull-requests: write
     strategy:
@@ -22,6 +23,7 @@ jobs:
         node-version: [20]
         pg-version: [14]
     env:
+      NODE_OPTIONS: --max-old-space-size=8192
       NODE_VERSION: ${{ matrix.node-version }}
       PG_VERSION: ${{ matrix.pg-version }}
     services:
@@ -39,7 +41,7 @@ jobs:
         ports:
           - 5432/tcp
       redis:
-        image: redis:6
+        image: redis:${{ matrix.redis-version }}
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
@@ -82,7 +84,7 @@ jobs:
           POSTGRES_PORT: ${{ job.services.postgres.ports[5432] }}
           REDIS_PASSWORD_DISABLED_IN_TESTS: 1
       - name: Upload code coverage
-        if: ${{ matrix.node-version == 20 && matrix.pg-version == 14 }}
+        if: ${{ matrix.node-version == 20 && matrix.pg-version == 14 && matrix.redis-version == 7 }}
         uses: actions/upload-artifact@v4
         with:
           name: medplum-code-coverage

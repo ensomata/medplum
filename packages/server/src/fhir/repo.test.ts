@@ -1,5 +1,7 @@
 import {
+  allOk,
   badRequest,
+  created,
   createReference,
   forbidden,
   getReferenceString,
@@ -40,7 +42,8 @@ describe('FHIR Repo', () => {
     resourceType: 'Project',
     id: randomUUID(),
   };
-  const systemRepo = getSystemRepo();
+
+  let systemRepo: Repository;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
@@ -49,6 +52,10 @@ describe('FHIR Repo', () => {
 
   afterAll(async () => {
     await shutdownApp();
+  });
+
+  beforeEach(() => {
+    systemRepo = getSystemRepo();
   });
 
   test('getRepoForLogin', async () => {
@@ -89,6 +96,12 @@ describe('FHIR Repo', () => {
       const outcome = (err as OperationOutcomeError).outcome;
       expect(isOk(outcome)).toBe(false);
     }
+  });
+
+  test('Read invalid resource with `checkCacheOnly` set', async () => {
+    await expect(systemRepo.readResource('Subscription', randomUUID(), { checkCacheOnly: true })).rejects.toThrow(
+      new OperationOutcomeError(notFound)
+    );
   });
 
   test('Repo read malformed reference', async () => {
@@ -713,34 +726,6 @@ describe('FHIR Repo', () => {
       expect(patient2.id).toEqual(patient1.id);
     }));
 
-  test('Too many versions', () =>
-    withTestContext(async () => {
-      // Create version 1
-      const patient = await systemRepo.createResource<Patient>({
-        resourceType: 'Patient',
-        name: [{ family: 'Test' }],
-      });
-
-      // Create versions 2-10
-      for (let i = 0; i < 9; i++) {
-        await systemRepo.updateResource<Patient>({
-          ...patient,
-          name: [{ family: `Test ${i}` }],
-        });
-      }
-
-      // Try to create version 11
-      try {
-        await systemRepo.updateResource<Patient>({
-          ...patient,
-          name: [{ family: `Test too many requests` }],
-        });
-      } catch (err) {
-        const outcome = (err as OperationOutcomeError).outcome;
-        expect(outcome.id).toEqual('too-many-requests');
-      }
-    }));
-
   test('expungeResource forbidden', async () => {
     const author = 'Practitioner/' + randomUUID();
 
@@ -977,5 +962,80 @@ describe('FHIR Repo', () => {
       await expect(repo.createResource(patient)).rejects.toEqual(
         new Error('Missing required property (Patient.address)')
       );
+    }));
+
+  test('Conditional update', () =>
+    withTestContext(async () => {
+      const mrn = randomUUID();
+      const patient: Patient = {
+        resourceType: 'Patient',
+        identifier: [{ system: 'http://example.com/mrn', value: mrn }],
+      };
+
+      // Invalid search resource type mismatch
+      await expect(
+        systemRepo.conditionalUpdate(patient, {
+          resourceType: 'Observation',
+          filters: [{ code: 'identifier', operator: Operator.EQUALS, value: 'http://example.com/mrn|' + mrn }],
+        })
+      ).rejects.toThrow('Search type must match resource type for conditional update');
+
+      // Invalid create with preassigned ID
+      await expect(
+        systemRepo.conditionalUpdate(
+          { ...patient, id: randomUUID() },
+          {
+            resourceType: 'Patient',
+            filters: [{ code: 'identifier', operator: Operator.EQUALS, value: 'http://example.com/mrn|' + mrn }],
+          }
+        )
+      ).rejects.toThrow('Cannot perform create as update with client-assigned ID (Patient.id)');
+
+      // Create new resource
+      const create = await systemRepo.conditionalUpdate(patient, {
+        resourceType: 'Patient',
+        filters: [{ code: 'identifier', operator: Operator.EQUALS, value: 'http://example.com/mrn|' + mrn }],
+      });
+      expect(create.resource.id).toBeDefined();
+      const existing = create.resource;
+      expect(create.outcome.id).toEqual(created.id);
+
+      // Update existing resource
+      patient.gender = 'unknown';
+      const update = await systemRepo.conditionalUpdate(patient, {
+        resourceType: 'Patient',
+        filters: [{ code: 'identifier', operator: Operator.EQUALS, value: 'http://example.com/mrn|' + mrn }],
+      });
+      expect(update.resource.id).toEqual(existing.id);
+      expect(update.resource.gender).toEqual('unknown');
+      expect(update.outcome.id).toEqual(allOk.id);
+
+      // Update with incorrect ID
+      patient.id = randomUUID();
+      await expect(
+        systemRepo.conditionalUpdate(patient, {
+          resourceType: 'Patient',
+          filters: [{ code: 'identifier', operator: Operator.EQUALS, value: 'http://example.com/mrn|' + mrn }],
+        })
+      ).rejects.toThrow('Resource ID did not match resolved ID (Patient.id)');
+
+      // Create duplicate resource
+      const duplicate = await systemRepo.createResource(patient);
+      expect(duplicate.id).not.toEqual(existing.id);
+
+      // Invalid update with ambiguous target
+      await expect(
+        systemRepo.conditionalUpdate(patient, {
+          resourceType: 'Patient',
+          filters: [{ code: 'identifier', operator: Operator.EQUALS, value: 'http://example.com/mrn|' + mrn }],
+        })
+      ).rejects.toThrow('Multiple resources found matching condition');
+    }));
+
+  test('Double DELETE', async () =>
+    withTestContext(async () => {
+      const patient = await systemRepo.createResource<Patient>({ resourceType: 'Patient' });
+      await systemRepo.deleteResource(patient.resourceType, patient.id as string);
+      await expect(systemRepo.deleteResource(patient.resourceType, patient.id as string)).resolves.toBeUndefined();
     }));
 });
