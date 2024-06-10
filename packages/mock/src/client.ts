@@ -1,10 +1,7 @@
 import {
-  allOk,
-  badRequest,
+  BinarySource,
   ContentType,
-  getStatus,
-  indexSearchParameter,
-  loadDataType,
+  CreateBinaryOptions,
   LoginState,
   MedplumClient,
   MedplumClientOptions,
@@ -12,11 +9,20 @@ import {
   OperationOutcomeError,
   ProfileResource,
   SubscriptionEmitter,
+  allOk,
+  badRequest,
+  generateId,
+  getReferenceString,
+  getStatus,
+  indexSearchParameter,
+  loadDataType,
+  normalizeCreateBinaryOptions,
 } from '@medplum/core';
 import { FhirRequest, FhirRouter, HttpMethod, MemoryRepository } from '@medplum/fhir-router';
 import {
   Agent,
   Binary,
+  Bot,
   Device,
   Reference,
   Resource,
@@ -38,7 +44,8 @@ import {
   ExampleQuestionnaire,
   ExampleQuestionnaireResponse,
   ExampleSubscription,
-  exampleValueSet,
+  ExampleThreadHeader,
+  ExampleThreadMessages,
   HomerCommunication,
   HomerDiagnosticReport,
   HomerEncounter,
@@ -55,8 +62,9 @@ import {
   HomerSimpson,
   HomerSimpsonPreviousVersion,
   HomerSimpsonSpecimen,
-  makeDrAliceSmithSlots,
   TestOrganization,
+  exampleValueSet,
+  makeDrAliceSmithSlots,
 } from './mocks';
 import { ExampleAccessPolicy, ExampleStatusValueSet, ExampleUserConfiguration } from './mocks/accesspolicy';
 import { TestProject, TestProjectMembership } from './mocks/project';
@@ -98,10 +106,12 @@ export class MockClient extends MedplumClient {
   constructor(clientOptions?: MockClientOptions) {
     const router = new FhirRouter();
     const repo = new MemoryRepository();
-    const client = new MockFetchClient(router, repo, clientOptions?.debug);
+
+    const baseUrl = clientOptions?.baseUrl ?? 'https://example.com/';
+    const client = new MockFetchClient(router, repo, baseUrl, clientOptions?.debug);
 
     super({
-      baseUrl: clientOptions?.baseUrl ?? 'https://example.com/',
+      baseUrl,
       clientId: clientOptions?.clientId,
       storage: clientOptions?.storage,
       createPdf: (
@@ -160,6 +170,7 @@ export class MockClient extends MedplumClient {
 
   setProfile(profile: ProfileResource | undefined): void {
     this.profile = profile;
+    this.dispatchEvent({ type: 'change' });
   }
 
   getActiveLogin(): LoginState | undefined {
@@ -177,11 +188,14 @@ export class MockClient extends MedplumClient {
   }
 
   async createBinary(
-    data: string | File | Blob | Uint8Array,
-    filename: string | undefined,
-    contentType: string,
-    onProgress?: (e: ProgressEvent) => void
+    arg1: BinarySource | CreateBinaryOptions,
+    arg2: string | undefined | MedplumRequestOptions,
+    arg3?: string,
+    arg4?: (e: ProgressEvent) => void
   ): Promise<Binary> {
+    const createBinaryOptions = normalizeCreateBinaryOptions(arg1, arg2, arg3, arg4);
+    const { filename, contentType, onProgress } = createBinaryOptions;
+
     if (filename?.endsWith('.exe')) {
       return Promise.reject(badRequest('Invalid file type'));
     }
@@ -211,20 +225,23 @@ export class MockClient extends MedplumClient {
       if (!this.agentAvailable) {
         throw new OperationOutcomeError(badRequest('Timeout'));
       }
-      if (typeof destination === 'string' && destination !== '8.8.8.8') {
+      if (typeof destination !== 'string' || (destination !== '8.8.8.8' && destination !== 'localhost')) {
         // Exception for test case
         if (destination !== 'abc123') {
-          console.warn('IPs other than 8.8.8.8 will always throw an error in MockClient');
+          console.warn(
+            'IPs other than 8.8.8.8 and hostnames other than `localhost` will always throw an error in MockClient'
+          );
         }
         throw new OperationOutcomeError(badRequest('Destination device not found'));
       }
-      return `PING 8.8.8.8 (8.8.8.8): 56 data bytes
-64 bytes from 8.8.8.8: icmp_seq=0 ttl=115 time=10.977 ms
-64 bytes from 8.8.8.8: icmp_seq=1 ttl=115 time=13.037 ms
-64 bytes from 8.8.8.8: icmp_seq=2 ttl=115 time=23.159 ms
-64 bytes from 8.8.8.8: icmp_seq=3 ttl=115 time=12.725 ms
+      const ip = destination === 'localhost' ? '127.0.0.1' : destination;
+      return `PING ${destination} (${ip}): 56 data bytes
+64 bytes from ${ip}: icmp_seq=0 ttl=115 time=10.977 ms
+64 bytes from ${ip}: icmp_seq=1 ttl=115 time=13.037 ms
+64 bytes from ${ip}: icmp_seq=2 ttl=115 time=23.159 ms
+64 bytes from ${ip}: icmp_seq=3 ttl=115 time=12.725 ms
 
---- 8.8.8.8 ping statistics ---
+--- ${destination} ping statistics ---
 4 packets transmitted, 4 packets received, 0.0% packet loss
 round-trip min/avg/max/stddev = 10.977/14.975/23.159/4.790 ms
 `;
@@ -265,6 +282,7 @@ export class MockFetchClient {
   constructor(
     readonly router: FhirRouter,
     readonly repo: MemoryRepository,
+    readonly baseUrl: string,
     readonly debug = false
   ) {}
 
@@ -278,7 +296,7 @@ export class MockFetchClient {
     }
 
     const method = options.method ?? 'GET';
-    const path = url.replace('https://example.com/', '');
+    const path = url.replace(this.baseUrl, '');
 
     if (this.debug) {
       console.log('MockClient', method, path);
@@ -326,7 +344,7 @@ export class MockFetchClient {
 
   private async mockHandler(method: HttpMethod, path: string, options: any): Promise<any> {
     if (path.startsWith('admin/')) {
-      return this.mockAdminHandler(method, path);
+      return this.mockAdminHandler(method, path, options);
     } else if (path.startsWith('auth/')) {
       return this.mockAuthHandler(method, path, options);
     } else if (path.startsWith('oauth2/')) {
@@ -338,26 +356,57 @@ export class MockFetchClient {
     }
   }
 
-  private async mockAdminHandler(_method: string, path: string): Promise<any> {
-    if (path === 'admin/projects/setpassword' && _method.toUpperCase() === 'POST') {
+  private async mockAdminHandler(method: string, path: string, options: RequestInit): Promise<any> {
+    if (path === 'admin/projects/setpassword' && method.toUpperCase() === 'POST') {
       return { ok: true };
     }
 
-    const projectMatch = /^admin\/projects\/([\w-]+)$/.exec(path);
+    // Create new bot
+    const botCreateMatch = /^admin\/projects\/([\w(-)?]+)\/bot$/.exec(path);
+    if (botCreateMatch && method.toUpperCase() === 'POST') {
+      const body = options.body;
+      let jsonBody: Record<string, any> | undefined;
+      if (body) {
+        jsonBody = JSON.parse(body as string);
+      }
+
+      const binary = await this.repo.createResource<Binary>({
+        id: generateId(),
+        resourceType: 'Binary',
+        contentType: ContentType.TYPESCRIPT,
+      });
+
+      const projectId = botCreateMatch[1];
+      return this.repo.createResource<Bot>({
+        meta: {
+          project: projectId,
+        },
+        id: generateId(),
+        resourceType: 'Bot',
+        name: jsonBody?.name,
+        description: jsonBody?.description,
+        runtimeVersion: jsonBody?.runtimeVersion ?? 'awslambda',
+        sourceCode: {
+          contentType: ContentType.TYPESCRIPT,
+          title: 'index.ts',
+          url: getReferenceString(binary),
+        },
+      });
+    }
+
+    const projectMatch = /^admin\/projects\/([\w(-)?]+)$/.exec(path);
     if (projectMatch) {
       return {
         project: await this.repo.readResource('Project', projectMatch[1]),
       };
     }
 
-    const membershipMatch = /^admin\/projects\/([\w-]+)\/members\/([\w-]+)$/.exec(path);
+    const membershipMatch = /^admin\/projects\/([\w(-)?]+)\/members\/([\w(-)?]+)$/.exec(path);
     if (membershipMatch) {
       return this.repo.readResource('ProjectMembership', membershipMatch[2]);
     }
 
-    return {
-      ok: true,
-    };
+    return { ok: true };
   }
 
   private mockAuthHandler(method: HttpMethod, path: string, options: any): any {
@@ -591,7 +640,9 @@ export class MockFetchClient {
       ExampleSmartClientApplication,
       TestProject,
       TestProjectMembership,
-    ];
+      ExampleThreadHeader,
+      ...ExampleThreadMessages,
+    ] satisfies Resource[];
 
     for (const resource of defaultResources) {
       await this.repo.createResource(resource);

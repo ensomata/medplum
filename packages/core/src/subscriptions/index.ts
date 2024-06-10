@@ -1,14 +1,20 @@
-import { Bundle, Parameters, Subscription, SubscriptionStatus } from '@medplum/fhirtypes';
+import { Bundle, Parameters, Subscription, SubscriptionStatus, Resource } from '@medplum/fhirtypes';
 import { MedplumClient } from '../client';
 import { TypedEventTarget } from '../eventtarget';
 import { OperationOutcomeError, serverError, validationError } from '../outcomes';
-import { ProfileResource, getReferenceString, resolveId } from '../utils';
+import { ProfileResource, getExtension, getReferenceString, resolveId } from '../utils';
+import { Logger } from '../logger';
+import { matchesSearchRequest } from '../search/match';
+import { toTypedValue } from '../fhirpath/utils';
+import { evalFhirPathTyped } from '../fhirpath/parse';
+import { parseSearchRequest } from '../search/search';
 
 export type SubscriptionEventMap = {
   connect: { type: 'connect'; payload: { subscriptionId: string } };
   disconnect: { type: 'disconnect'; payload: { subscriptionId: string } };
   error: { type: 'error'; payload: Error };
   message: { type: 'message'; payload: Bundle };
+  open: { type: 'open' };
   close: { type: 'close' };
   heartbeat: { type: 'heartbeat'; payload: Bundle };
 };
@@ -101,6 +107,7 @@ export class RobustWebSocket extends TypedEventTarget<RobustWebSocketEventMap> i
  * - `disconnect` - The specified subscription is no longer being monitored by the `SubscriptionManager`.
  * - `error` - An error has occurred.
  * - `message` - A message containing a notification `Bundle` has been received.
+ * - `open` - The WebSocket has been opened.
  * - `close` - The WebSocket has been closed.
  * - `heartbeat` - A `heartbeat` message has been received.
  */
@@ -259,7 +266,7 @@ export class SubscriptionManager {
 
     // Get binding token
     const { parameter } = (await this.medplum.get(
-      `/fhir/R4/Subscription/${subscriptionId}/$get-ws-binding-token`
+      `fhir/R4/Subscription/${subscriptionId}/$get-ws-binding-token`
     )) as Parameters;
     const token = parameter?.find((param) => param.name === 'token')?.valueString;
     const url = parameter?.find((param) => param.name === 'websocket-url')?.valueUrl;
@@ -290,7 +297,6 @@ export class SubscriptionManager {
       .then(([subscriptionId, token]) => {
         newCriteriaEntry.subscriptionId = subscriptionId;
         this.criteriaEntriesBySubscriptionId.set(subscriptionId, newCriteriaEntry);
-
         // Emit connect event
         this.emitConnect(subscriptionId);
         // Send binding message
@@ -353,4 +359,117 @@ export class SubscriptionManager {
     }
     return this.masterSubEmitter;
   }
+}
+
+export type BackgroundJobInteraction = 'create' | 'update' | 'delete';
+
+export interface BackgroundJobContext {
+  interaction: BackgroundJobInteraction;
+}
+
+export type ResourceMatchesSubscriptionCriteria = {
+  resource: Resource;
+  subscription: Subscription;
+  context: BackgroundJobContext;
+  logger?: Logger;
+  getPreviousResource: (currentResource: Resource) => Promise<Resource | undefined>;
+};
+
+export async function resourceMatchesSubscriptionCriteria({
+  resource,
+  subscription,
+  context,
+  getPreviousResource,
+  logger,
+}: ResourceMatchesSubscriptionCriteria): Promise<boolean> {
+  if (subscription.meta?.account && resource.meta?.account?.reference !== subscription.meta.account.reference) {
+    logger?.debug('Ignore resource in different account compartment');
+    return false;
+  }
+
+  if (!matchesChannelType(subscription, logger)) {
+    logger?.debug(`Ignore subscription without recognized channel type`);
+    return false;
+  }
+
+  const subscriptionCriteria = subscription.criteria;
+  if (!subscriptionCriteria) {
+    logger?.debug(`Ignore rest hook missing criteria`);
+    return false;
+  }
+
+  const searchRequest = parseSearchRequest(subscriptionCriteria);
+  if (resource.resourceType !== searchRequest.resourceType) {
+    logger?.debug(
+      `Ignore rest hook for different resourceType (wanted "${searchRequest.resourceType}", received "${resource.resourceType}")`
+    );
+    return false;
+  }
+
+  const fhirPathCriteria = await isFhirCriteriaMet(subscription, resource, getPreviousResource);
+  if (!fhirPathCriteria) {
+    logger?.debug(`Ignore rest hook for criteria returning false`);
+    return false;
+  }
+
+  const supportedInteractionExtension = getExtension(
+    subscription,
+    'https://medplum.com/fhir/StructureDefinition/subscription-supported-interaction'
+  );
+  if (supportedInteractionExtension && supportedInteractionExtension.valueCode !== context.interaction) {
+    logger?.debug(
+      `Ignore rest hook for different interaction (wanted "${supportedInteractionExtension.valueCode}", received "${context.interaction}")`
+    );
+    return false;
+  }
+
+  return matchesSearchRequest(resource, searchRequest);
+}
+
+/**
+ * Returns true if the subscription channel type is ok to execute.
+ * @param subscription - The subscription resource.
+ * @param logger - The logger.
+ * @returns True if the subscription channel type is ok to execute.
+ */
+function matchesChannelType(subscription: Subscription, logger?: Logger): boolean {
+  const channelType = subscription.channel?.type;
+
+  if (channelType === 'rest-hook') {
+    const url = subscription.channel?.endpoint;
+    if (!url) {
+      logger?.debug(`Ignore rest-hook missing URL`);
+      return false;
+    }
+
+    return true;
+  }
+
+  if (channelType === 'websocket') {
+    return true;
+  }
+
+  return false;
+}
+
+export async function isFhirCriteriaMet(
+  subscription: Subscription,
+  currentResource: Resource,
+  getPreviousResource: (currentResource: Resource) => Promise<Resource | undefined>
+): Promise<boolean> {
+  const criteria = getExtension(
+    subscription,
+    'https://medplum.com/fhir/StructureDefinition/fhir-path-criteria-expression'
+  );
+  if (!criteria?.valueString) {
+    return true;
+  }
+  const previous = await getPreviousResource(currentResource);
+  const evalInput = {
+    '%current': toTypedValue(currentResource),
+    '%previous': toTypedValue(previous ?? {}),
+  };
+  const evalValue = evalFhirPathTyped(criteria.valueString, [toTypedValue(currentResource)], evalInput);
+  console.log(evalValue);
+  return evalValue?.[0]?.value === true;
 }
