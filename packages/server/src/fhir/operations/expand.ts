@@ -1,15 +1,13 @@
 import { allOk, badRequest, OperationOutcomeError } from '@medplum/core';
-import { CodeSystem, ValueSet, ValueSetComposeInclude, ValueSetExpansionContains } from '@medplum/fhirtypes';
-import { Request, Response } from 'express';
-import { asyncWrap } from '../../async';
-import { sendOutcome } from '../outcomes';
-import { Column, Condition, Conjunction, SelectQuery, Expression, Disjunction, Union } from '../sql';
+import { FhirRequest, FhirResponse } from '@medplum/fhir-router';
+import { CodeSystem, Coding, ValueSet, ValueSetComposeInclude, ValueSetExpansionContains } from '@medplum/fhirtypes';
 import { getAuthenticatedContext } from '../../context';
-import { clamp, parseInputParameters, sendOutputParameters } from './utils/parameters';
 import { getDatabasePool } from '../../database';
+import { Column, Condition, Conjunction, Disjunction, Expression, SelectQuery, Union } from '../sql';
+import { validateCodings } from './codesystemvalidatecode';
 import { getOperationDefinition } from './definitions';
+import { buildOutputParameters, clamp, parseInputParameters } from './utils/parameters';
 import { abstractProperty, addPropertyFilter, findTerminologyResource, getParentProperty } from './utils/terminology';
-import { validateCoding } from './codesystemvalidatecode';
 
 const operation = getOperationDefinition('ValueSet', 'expand');
 
@@ -30,19 +28,17 @@ type ValueSetExpandParameters = {
 // 3) Optional offset for pagination (default is zero for beginning)
 // 4) Optional count for pagination (default is 10, can be 1-1000)
 
-export const expandOperator = asyncWrap(async (req: Request, res: Response) => {
+export async function expandOperator(req: FhirRequest): Promise<FhirResponse> {
   const params = parseInputParameters<ValueSetExpandParameters>(operation, req);
 
   let url = params.url;
   if (!url) {
-    sendOutcome(res, badRequest('Missing url'));
-    return;
+    return [badRequest('Missing url')];
   }
 
   const filter = params.filter;
   if (filter !== undefined && typeof filter !== 'string') {
-    sendOutcome(res, badRequest('Invalid filter'));
-    return;
+    return [badRequest('Invalid filter')];
   }
 
   const pipeIndex = url.indexOf('|');
@@ -50,7 +46,7 @@ export const expandOperator = asyncWrap(async (req: Request, res: Response) => {
     url = url.substring(0, pipeIndex);
   }
 
-  let valueSet = await findTerminologyResource<ValueSet>('ValueSet', url);
+  const valueSet = await findTerminologyResource<ValueSet>('ValueSet', url);
 
   let offset = 0;
   if (params.offset) {
@@ -62,21 +58,23 @@ export const expandOperator = asyncWrap(async (req: Request, res: Response) => {
     count = clamp(params.count, 1, 1000);
   }
 
+  let result: ValueSet;
   if (shouldUseLegacyTable()) {
     const elements = await queryValueSetElements(valueSet, offset, count, filter);
-    await sendOutputParameters(req, res, operation, allOk, {
+    result = {
       resourceType: 'ValueSet',
       url,
       expansion: {
         offset,
         contains: elements,
       },
-    } as ValueSet);
+    } as ValueSet;
   } else {
-    valueSet = await expandValueSet(valueSet, params);
-    await sendOutputParameters(req, res, operation, allOk, valueSet);
+    result = await expandValueSet(valueSet, params);
   }
-});
+
+  return [allOk, buildOutputParameters(operation, result)];
+}
 
 function shouldUseLegacyTable(): boolean {
   const ctx = getAuthenticatedContext();
@@ -145,6 +143,8 @@ function buildValueSetSystems(valueSet: ValueSet): Expression[] {
     for (const include of valueSet.compose.include) {
       processInclude(result, include);
     }
+  } else if (valueSet.expansion?.contains) {
+    processExpansion(result, valueSet.expansion.contains);
   }
   return result;
 }
@@ -167,18 +167,53 @@ function processInclude(systemExpressions: Expression[], include: ValueSetCompos
   }
 }
 
+function processExpansion(systemExpressions: Expression[], expansionContains: ValueSetExpansionContains[]): void {
+  if (!expansionContains) {
+    return;
+  }
+
+  const systemToConcepts: Record<string, ValueSetExpansionContains[]> = Object.create(null);
+
+  for (const code of expansionContains) {
+    if (!code.system) {
+      continue;
+    }
+    if (!(code.system in systemToConcepts)) {
+      systemToConcepts[code.system] = [];
+    }
+    systemToConcepts[code.system].push(code);
+  }
+
+  for (const [system, concepts] of Object.entries(systemToConcepts)) {
+    const systemExpression = new Condition('system', '=', system);
+    const codeExpressions: Expression[] = [];
+    for (const concept of concepts) {
+      codeExpressions.push(new Condition('code', '=', concept.code));
+    }
+    systemExpressions.push(new Conjunction([systemExpression, new Disjunction(codeExpressions)]));
+  }
+}
+
 const MAX_EXPANSION_SIZE = 1001;
 
+function filterCodings(codings: Coding[], filter: string | undefined): Coding[] {
+  filter = filter?.trim().toLowerCase();
+  if (!filter) {
+    return codings;
+  }
+  return codings.filter((c) => c.display?.toLowerCase().includes(filter));
+}
+
 export async function expandValueSet(valueSet: ValueSet, params: ValueSetExpandParameters): Promise<ValueSet> {
+  let expandedSet: ValueSetExpansionContains[];
+
   const expansion = valueSet.expansion;
   if (expansion?.contains?.length && !expansion.parameter && expansion.total === expansion.contains.length) {
     // Full expansion is already available, use that
-    return valueSet;
+    expandedSet = filterCodings(expansion.contains, params.filter);
+  } else {
+    expandedSet = await computeExpansion(valueSet, params);
   }
-
-  // Compute expansion
-  const expandedSet = [] as ValueSetExpansionContains[];
-  await computeExpansion(valueSet, expandedSet, params);
   if (expandedSet.length >= MAX_EXPANSION_SIZE) {
     valueSet.expansion = {
       total: 1001,
@@ -197,12 +232,12 @@ export async function expandValueSet(valueSet: ValueSet, params: ValueSetExpandP
 
 async function computeExpansion(
   valueSet: ValueSet,
-  expansion: ValueSetExpansionContains[],
   params: ValueSetExpandParameters
-): Promise<void> {
+): Promise<ValueSetExpansionContains[]> {
   if (!valueSet.compose?.include.length) {
     throw new OperationOutcomeError(badRequest('Missing ValueSet definition', 'ValueSet.compose.include'));
   }
+  const expansion: ValueSetExpansionContains[] = [];
 
   const { count, filter } = params;
 
@@ -217,9 +252,10 @@ async function computeExpansion(
     const codeSystem = codeSystemCache[include.system] ?? (await findTerminologyResource('CodeSystem', include.system));
     codeSystemCache[include.system] = codeSystem;
     if (include.concept) {
-      const concepts = await Promise.all(include.concept.flatMap((c) => validateCoding(codeSystem, c)));
-      for (const c of concepts) {
-        if (c && (!filter || c.display?.includes(filter))) {
+      const filteredCodings = filterCodings(include.concept, filter);
+      const validCodings = await validateCodings(codeSystem, filteredCodings);
+      for (const c of validCodings) {
+        if (c) {
           c.id = undefined;
           expansion.push(c);
         }
@@ -230,9 +266,11 @@ async function computeExpansion(
 
     if (expansion.length > (count ?? MAX_EXPANSION_SIZE)) {
       // Return partial expansion
-      return;
+      break;
     }
   }
+
+  return expansion;
 }
 
 async function includeInExpansion(
@@ -259,6 +297,9 @@ async function includeInExpansion(
       switch (condition.op) {
         case 'is-a':
           query = addDescendants(query, codeSystem, condition.value);
+          break;
+        case 'descendent-of':
+          query = addDescendants(query, codeSystem, condition.value).where('code', '!=', condition.value);
           break;
         case '=':
           query = addPropertyFilter(query, condition.property, condition.value, true);

@@ -4,13 +4,22 @@ import { ComplexTypeInputProps } from '../ResourcePropertyInput/ResourceProperty
 import { ValueSetAutocomplete, ValueSetAutocompleteProps } from '../ValueSetAutocomplete/ValueSetAutocomplete';
 
 export interface CodeableConceptInputProps
-  extends Omit<ValueSetAutocompleteProps, 'name' | 'defaultValue' | 'onChange'>,
+  extends Omit<ValueSetAutocompleteProps, 'name' | 'defaultValue' | 'onChange' | 'disabled'>,
     ComplexTypeInputProps<CodeableConcept> {
-  readonly onChange: ((value: CodeableConcept | undefined) => void) | undefined;
+  readonly onChange?: (value: CodeableConcept | undefined) => void;
 }
 
 export function CodeableConceptInput(props: CodeableConceptInputProps): JSX.Element {
-  const { defaultValue, onChange, withHelpText, ...rest } = props;
+  const {
+    defaultValue,
+    onChange,
+    withHelpText,
+    // spread these unused props so they don't get passed to ValueSetAutocomplete in `rest`
+    outcome: _outcome,
+    path: _path,
+    valuePath: _valuePath,
+    ...rest
+  } = props;
   const [value, setValue] = useState<CodeableConcept | undefined>(defaultValue);
 
   function handleChange(newValues: ValueSetExpansionContains[]): void {

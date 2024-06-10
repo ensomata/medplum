@@ -4,7 +4,6 @@ import {
   OAuthClientAssertionType,
   OAuthGrantType,
   OAuthTokenType,
-  parseJWTPayload,
   parseSearchRequest,
 } from '@medplum/core';
 import { AccessPolicy, ClientApplication, Login, Project, SmartAppLaunch } from '@medplum/fhirtypes';
@@ -23,7 +22,6 @@ import { createTestProject, withTestContext } from '../test.setup';
 import { generateSecret } from './keys';
 import { hashCode } from './token';
 
-jest.mock('@aws-sdk/client-sesv2');
 jest.mock('jose', () => {
   const core = jest.requireActual('@medplum/core');
   const original = jest.requireActual('jose');
@@ -277,24 +275,6 @@ describe('OAuth2 Token', () => {
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('invalid_request');
     expect(res.body.error_description).toBe('Invalid client');
-  });
-
-  test('Token for client in super admin', async () => {
-    const { client } = await createTestProject({ superAdmin: true, withClient: true });
-    const res1 = await request(app).post('/oauth2/token').type('form').send({
-      grant_type: 'client_credentials',
-      client_id: client.id,
-      client_secret: client.secret,
-    });
-    expect(res1.status).toBe(200);
-    expect(res1.body.error).toBeUndefined();
-    expect(res1.body.access_token).toBeDefined();
-
-    // Expect login to be a super admin login
-    const claims = parseJWTPayload(res1.body.access_token);
-    expect(claims.login_id).toBeDefined();
-    const login = await systemRepo.readResource<Login>('Login', claims.login_id as string);
-    expect(login.superAdmin).toBe(true);
   });
 
   test('Token for client in "off" status', async () => {
@@ -1694,6 +1674,45 @@ describe('OAuth2 Token', () => {
     expect(res.body.access_token).toBeDefined();
     expect(res.body['hub.topic']).not.toBeDefined();
     expect(res.body['hub.url']).not.toBeDefined();
+  });
+
+  test('Refresh tokens disabled for super admins', async () => {
+    // Create a super admin project
+    const { project } = await createTestProject({ project: { superAdmin: true } });
+
+    // Create a test user
+    const email = `test-${randomUUID()}@example.com`;
+    const password = 'test-password';
+    await inviteUser({
+      project,
+      resourceType: 'Practitioner',
+      firstName: 'Test',
+      lastName: 'Test',
+      email,
+      password,
+    });
+
+    const res = await request(app).post('/auth/login').type('json').send({
+      email,
+      password,
+      codeChallenge: 'xyz',
+      codeChallengeMethod: 'plain',
+      scope: 'openid offline', // Request offline access
+    });
+    expect(res.status).toBe(200);
+
+    const res2 = await request(app).post('/oauth2/token').type('form').send({
+      grant_type: 'authorization_code',
+      code: res.body.code,
+      code_verifier: 'xyz',
+    });
+    expect(res2.status).toBe(200);
+    expect(res2.body.token_type).toBe('Bearer');
+    expect(res2.body.scope).toBe('openid offline');
+    expect(res2.body.expires_in).toBe(3600);
+    expect(res2.body.id_token).toBeDefined();
+    expect(res2.body.access_token).toBeDefined();
+    expect(res2.body.refresh_token).toBeUndefined();
   });
 });
 

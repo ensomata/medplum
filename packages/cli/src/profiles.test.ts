@@ -1,18 +1,18 @@
 import { ContentType, MedplumClient } from '@medplum/core';
-import { mkdtempSync, rmSync } from 'fs';
-import os from 'os';
-import { sep } from 'path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import { sep } from 'node:path';
 import { main } from '.';
 import { FileSystemStorage } from './storage';
 import { createMedplumClient } from './util/client';
 
-jest.mock('os');
+jest.mock('node:os');
 jest.mock('fast-glob', () => ({
   sync: jest.fn(() => []),
 }));
 jest.mock('./util/client');
-jest.mock('fs', () => ({
-  ...jest.requireActual('fs'),
+jest.mock('node:fs', () => ({
+  ...jest.requireActual('node:fs'),
   writeFile: jest.fn((path, data, callback) => {
     callback();
   }),
@@ -173,8 +173,6 @@ describe('Profiles', () => {
     // Describe profile
     await main(['node', 'index.js', 'profile', 'describe', profileName]);
     expect(console.log).toHaveBeenCalledWith(obj);
-
-    expect(console.log).toHaveBeenCalledWith(expect.stringMatching('testProfile profile create'));
 
     // Replace the previous values
     const obj2 = {

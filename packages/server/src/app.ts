@@ -36,7 +36,7 @@ import { keyValueRouter } from './keyvalue/routes';
 import { initKeys } from './oauth/keys';
 import { oauthRouter } from './oauth/routes';
 import { openApiHandler } from './openapi';
-import { closeRateLimiter } from './ratelimit';
+import { closeRateLimiter, getRateLimiter } from './ratelimit';
 import { closeRedis, initRedis } from './redis';
 import { scimRouter } from './scim/routes';
 import { seedDatabase } from './seed';
@@ -135,12 +135,13 @@ export async function initApp(app: Express, config: MedplumServerConfig): Promis
   initWebSockets(server);
 
   app.set('etag', false);
-  app.set('trust proxy', true);
+  app.set('trust proxy', 1);
   app.set('x-powered-by', false);
   app.use(standardHeaders);
   app.use(cors(corsOptions));
   app.use(compression());
   app.use(attachRequestContext);
+  app.use(getRateLimiter(config));
   app.use('/fhir/R4/Binary', binaryRouter);
   app.use(
     urlencoded({
@@ -206,15 +207,17 @@ export function initAppServices(config: MedplumServerConfig): Promise<void> {
 }
 
 export async function shutdownApp(): Promise<void> {
-  await closeWorkers();
-  await closeDatabase();
   cleanupHeartbeat();
   await closeWebSockets();
+  await closeWorkers();
+  await closeDatabase();
   await closeRedis();
   closeRateLimiter();
 
   if (server) {
-    server.close();
+    await new Promise((resolve) => {
+      (server as http.Server).close(resolve);
+    });
     server = undefined;
   }
 

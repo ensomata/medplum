@@ -12,7 +12,7 @@ import {
 } from '../outcomes';
 import { PropertyType, TypedValue, isReference } from '../types';
 import { arrayify, deepEquals, deepIncludes, isEmpty, isLowerCase } from '../utils';
-import { ResourceVisitor, crawlResource, getNestedProperty } from './crawler';
+import { ResourceVisitor, TypedValueWithPath, crawlResource, getNestedProperty } from './crawler';
 import {
   Constraint,
   InternalSchemaElement,
@@ -147,13 +147,13 @@ class ResourceValidator implements ResourceVisitor {
     return issues;
   }
 
-  onExitObject(path: string, obj: TypedValue, schema: InternalTypeSchema): void {
+  onExitObject(path: string, obj: TypedValueWithPath, schema: InternalTypeSchema): void {
     //@TODO(mattwiller 2023-06-05): Detect extraneous properties in a single pass by keeping track of all keys that
     // were correctly matched to resource properties as elements are validated above
     this.checkAdditionalProperties(obj, schema.elements, path);
   }
 
-  onEnterResource(_path: string, obj: TypedValue): void {
+  onEnterResource(_path: string, obj: TypedValueWithPath): void {
     this.currentResource.push(obj.value);
   }
 
@@ -162,22 +162,23 @@ class ResourceValidator implements ResourceVisitor {
   }
 
   visitProperty(
-    _parent: TypedValue,
+    _parent: TypedValueWithPath,
     key: string,
     path: string,
-    propertyValues: (TypedValue | TypedValue[] | undefined)[],
+    propertyValues: (TypedValueWithPath | TypedValueWithPath[])[],
     schema: InternalTypeSchema
   ): void {
     const element = schema.elements[key];
     if (!element) {
       throw new Error(`Missing element validation schema for ${key}`);
     }
+
     for (const value of propertyValues) {
       if (!this.checkPresence(value, element, path)) {
         return;
       }
       // Check cardinality
-      let values: TypedValue[];
+      let values: TypedValueWithPath[];
       if (element.isArray) {
         if (!Array.isArray(value)) {
           this.issues.push(createStructureIssue(path, 'Expected array of values for property'));
@@ -225,20 +226,22 @@ class ResourceValidator implements ResourceVisitor {
   }
 
   private checkPresence(
-    value: TypedValue | TypedValue[] | undefined,
+    value: TypedValueWithPath | TypedValueWithPath[],
     field: InternalSchemaElement,
     path: string
-  ): value is TypedValue | TypedValue[] {
-    if (value === undefined) {
+  ): boolean {
+    if (!Array.isArray(value) && value.value === undefined) {
       if (field.min > 0) {
-        this.issues.push(createStructureIssue(path, 'Missing required property'));
+        this.issues.push(createStructureIssue(value.path, 'Missing required property'));
       }
       return false;
     }
+
     if (isEmpty(value)) {
       this.issues.push(createStructureIssue(path, 'Invalid empty value'));
       return false;
     }
+
     return true;
   }
 
@@ -280,13 +283,38 @@ class ResourceValidator implements ResourceVisitor {
     if (!object) {
       return;
     }
-    const choiceOfTypeElements: Record<string, boolean> = {};
+    const choiceOfTypeElements: Record<string, string> = {};
     for (const key of Object.keys(object)) {
       if (key === 'resourceType') {
         continue; // Skip special resource type discriminator property in JSON
       }
       const choiceOfTypeElementName = isChoiceOfType(parent, key, properties);
       if (choiceOfTypeElementName) {
+        // check that the type of the primitive extension matches the type of the property
+        let relatedElementName: string;
+        let requiredRelatedElementName: string;
+        if (choiceOfTypeElementName.startsWith('_')) {
+          relatedElementName = choiceOfTypeElementName.slice(1);
+          requiredRelatedElementName = key.slice(1);
+        } else {
+          relatedElementName = '_' + choiceOfTypeElementName;
+          requiredRelatedElementName = '_' + key;
+        }
+
+        if (
+          relatedElementName in choiceOfTypeElements &&
+          choiceOfTypeElements[relatedElementName] !== requiredRelatedElementName
+        ) {
+          this.issues.push(
+            createOperationOutcomeIssue(
+              'warning',
+              'structure',
+              `Type of primitive extension does not match the type of property "${choiceOfTypeElementName.startsWith('_') ? choiceOfTypeElementName.slice(1) : choiceOfTypeElementName}"`,
+              choiceOfTypeElementName
+            )
+          );
+        }
+
         if (choiceOfTypeElements[choiceOfTypeElementName]) {
           // Found a duplicate choice of type property
           // TODO: This should be an error, but it's currently a warning to avoid breaking existing code
@@ -300,7 +328,7 @@ class ResourceValidator implements ResourceVisitor {
             )
           );
         }
-        choiceOfTypeElements[choiceOfTypeElementName] = true;
+        choiceOfTypeElements[choiceOfTypeElementName] = key;
         continue;
       }
       if (!(key in properties) && !(key.startsWith('_') && key.slice(1) in properties)) {
@@ -483,8 +511,10 @@ function isChoiceOfType(
   key: string,
   propertyDefinitions: Record<string, InternalSchemaElement>
 ): string | undefined {
+  let prefix = '';
   if (key.startsWith('_')) {
     key = key.slice(1);
+    prefix = '_';
   }
   const parts = key.split(/(?=[A-Z])/g); // Split before capital letters
   let testProperty = '';
@@ -493,7 +523,7 @@ function isChoiceOfType(
     const elementName = testProperty + '[x]';
     if (propertyDefinitions[elementName]) {
       const typedPropertyValue = getTypedPropertyValue(typedValue, testProperty);
-      return typedPropertyValue ? elementName : undefined;
+      return typedPropertyValue ? prefix + elementName : undefined;
     }
   }
   return undefined;
@@ -524,10 +554,16 @@ function checkObjectForNull(obj: Record<string, unknown>, path: string, issues: 
 }
 
 function matchesSpecifiedValue(value: TypedValue | TypedValue[], element: InternalSchemaElement): boolean {
-  if (element.pattern && !deepIncludes(value, element.pattern)) {
+  // It is possible that `value` has additional keys beyond `type` and `value` (e.g. `expression` if a
+  // `TypedValueWithExpression` is being used), so ensure that only `type` and `value` are considered for comparison.
+  const typeAndValue = Array.isArray(value)
+    ? value.map((v) => ({ type: v.type, value: v.value }))
+    : { type: value.type, value: value.value };
+
+  if (element.pattern && !deepIncludes(typeAndValue, element.pattern)) {
     return false;
   }
-  if (element.fixed && !deepEquals(value, element.fixed)) {
+  if (element.fixed && !deepEquals(typeAndValue, element.fixed)) {
     return false;
   }
   return true;
@@ -544,7 +580,12 @@ export function matchDiscriminant(
     return false;
   }
 
-  const sliceElement: InternalSchemaElement = (elements ?? slice.elements)[discriminator.path];
+  let sliceElement: InternalSchemaElement | undefined;
+  if (discriminator.path === '$this') {
+    sliceElement = slice;
+  } else {
+    sliceElement = (elements ?? slice.elements)[discriminator.path];
+  }
 
   const sliceType = slice.type;
   switch (discriminator.type) {
@@ -553,7 +594,17 @@ export function matchDiscriminant(
       if (!value || !sliceElement) {
         return false;
       }
-      if (matchesSpecifiedValue(value, sliceElement)) {
+      if (sliceElement.pattern) {
+        return deepIncludes(value, sliceElement.pattern);
+      }
+      if (sliceElement.fixed) {
+        return deepEquals(value, sliceElement.fixed);
+      }
+
+      if (sliceElement.binding?.strength === 'required' && sliceElement.binding.valueSet) {
+        // This cannot be implemented correctly without asynchronous validation, so make it permissive for now.
+        // Ideally this should check something like value.value.coding.some((code) => isValidCode(sliceElement.binding.valueSet, code))
+        // where isValidCode is a function that checks if the code is included in the expansion of the ValueSet
         return true;
       }
       break;
